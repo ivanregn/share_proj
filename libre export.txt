@@ -1,4 +1,4 @@
-procedure ExportToLibreOfficeLinux(ADataSource: TDataSource; const ATemplatePath, ASavePath: string);
+procedure TForm1.ExportToLibreOfficeLinux(ADataSource: TDataSource; const ATemplatePath, ASavePath: string);
 var
   OrigZip, NewZip: TZipFile;
   XmlContent: TStringList;
@@ -26,7 +26,7 @@ begin
   if not DataSet.Active then
     DataSet.Open;
 
-  // ИСПРАВЛЕНИЕ: Автоматически проверяем и создаем папку назначения (например, .../output/)
+  // Автоматически проверяем и создаем папку назначения (например, .../output/)
   TargetDir := TPath.GetDirectoryName(ASavePath);
   if (TargetDir <> '') and (not TDirectory.Exists(TargetDir)) then
     TDirectory.CreateDirectory(TargetDir);
@@ -42,7 +42,7 @@ begin
   try
     // 2. Открываем оригинальный шаблон только для чтения
     OrigZip.Open(ATemplatePath, zmRead);
-    
+
     // Читаем исходный XML-контент в память
     OrigZip.Read('content.xml', XmlStream, Header);
     try
@@ -64,21 +64,21 @@ begin
           for ColIndex := 0 to DataSet.FieldCount - 1 do
           begin
             FieldValue := DataSet.Fields[ColIndex].AsString;
-            // Экранируем спецсимволы XML
+            // Экранируем спецсимволы XML для безопасности данных
             FieldValue := FieldValue.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;');
 
             // Проверяем тип данных
             if DataSet.Fields[ColIndex].DataType in [ftInteger, ftFloat, ftCurrency, ftLargeint, ftBCD] then
             begin
               NumValue := DataSet.Fields[ColIndex].AsFloat.ToString(TFormatSettings.Invariant);
-              // Запись чисел без AppendFormat
-              DataRowsBuilder.Append('<table:table-cell office:value-type="float" office:value="' + 
+              // Запись чисел напрямую без AppendFormat
+              DataRowsBuilder.Append('<table:table-cell office:value-type="float" office:value="' +
                 NumValue + '"><text:p>' + FieldValue + '</text:p></table:table-cell>');
             end
             else
             begin
-              // Запись текста без AppendFormat
-              DataRowsBuilder.Append('<table:table-cell office:value-type="string"><text:p>' + 
+              // Запись текста напрямую без AppendFormat
+              DataRowsBuilder.Append('<table:table-cell office:value-type="string"><text:p>' +
                 FieldValue + '</text:p></table:table-cell>');
             end;
           end;
@@ -113,18 +113,30 @@ begin
 
       // Вставляем подготовленные данные строго со строки 3
       ContentStr := ContentStr.Insert(InsertPos, DataRowsBuilder.ToString);
-    end;
     finally
       DataRowsBuilder.Free;
     end;
 
-    // 5. Создаем новый файл отчета (Совместимо со всеми версиями Delphi)
+    // 5. Создаем новый файл отчета (Соблюдая строгие стандарты ODF-валидации)
     NewZip.Open(ASavePath, zmWrite);
 
-    // Переносим все служебные файлы шаблона (стили, конфигурацию) в новый архив
+    // СНАЧАЛА переносим файл mimetype БЕЗ СЖАТИЯ (критично для LibreOffice)
+    if OrigZip.IndexOf('mimetype') <> -1 then
+    begin
+      OrigZip.Read('mimetype', TempStream, TempHeader);
+      try
+        TempHeader.CompressionMethod := 0; // Форсируем метод Store (без сжатия)
+        NewZip.Add(TempStream, 'mimetype');
+      finally
+        TempStream.Free;
+      end;
+    end;
+
+    // ТЕПЕРЬ переносим все остальные служебные файлы шаблона (стили, конфигурацию)
     for InternalFileName in OrigZip.FileNames do
     begin
-      if InternalFileName <> 'content.xml' then
+      // Пропускаем контент и миметайп, который уже добавили первым
+      if (InternalFileName <> 'content.xml') and (InternalFileName <> 'mimetype') then
       begin
         OrigZip.Read(InternalFileName, TempStream, TempHeader);
         try
@@ -135,7 +147,7 @@ begin
       end;
     end;
 
-    // Помещаем наш обновленный content.xml с данными из СУБД
+    // В САМОМ КОНЦЕ помещаем наш обновленный content.xml с данными из СУБД
     XmlContent.Text := ContentStr;
     NewXmlStream := TStringStream.Create(XmlContent.Text, TEncoding.UTF8);
     try
