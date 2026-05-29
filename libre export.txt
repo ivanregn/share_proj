@@ -1,6 +1,6 @@
 procedure ExportToLibreOfficeLinux(ADataSource: TDataSource; const ATemplatePath, ASavePath: string);
 var
-  Zip: TZipFile;
+  OrigZip, NewZip: TZipFile;
   XmlContent: TStringList;
   DataSet: TDataSet;
   ColIndex: Integer;
@@ -13,7 +13,10 @@ var
   Header: TZipHeader;
   DataRowsBuilder: TStringBuilder;
   RowsFound: Integer;
+  InternalFileName: string;
   TargetDir: string;
+  TempStream: TStream;
+  TempHeader: TZipHeader;
 begin
   // 1. Проверки входных данных
   if (ADataSource = nil) or (ADataSource.DataSet = nil) then
@@ -23,28 +26,23 @@ begin
   if not DataSet.Active then
     DataSet.Open;
 
-  // Проверяем и создаем папку назначения (например, .../output/)
+  // Проверяем и создаем папку назначения
   TargetDir := TPath.GetDirectoryName(ASavePath);
   if (TargetDir <> '') and (not TDirectory.Exists(TargetDir)) then
     TDirectory.CreateDirectory(TargetDir);
 
-  // Если старый файл отчета уже существует — удаляем его
+  // Если старый файл отчета существует — удаляем его
   if TFile.Exists(ASavePath) then
     TFile.Delete(ASavePath);
 
-  // ШАГ-ФИКС: Вместо ручной сборки ZIP с нуля, мы делаем точную копию оригинального шаблона.
-  // Это гарантирует, что файл "mimetype" и структуры папок останутся нетронутыми и валидными!
-  TFile.Copy(ATemplatePath, ASavePath);
-
-  Zip := TZipFile.Create;
+  OrigZip := TZipFile.Create;
+  NewZip := TZipFile.Create;
   XmlContent := TStringList.Create;
   DataRowsBuilder := TStringBuilder.Create;
   try
-    // 2. Открываем скопированный файл в режиме добавления/изменения (zmReadWrite)
-    Zip.Open(ASavePath, zmReadWrite);
-    
-    // Читаем исходный XML-контент в память
-    Zip.Read('content.xml', XmlStream, Header);
+    // 2. Читаем оригинальный XML из шаблона
+    OrigZip.Open(ATemplatePath, zmRead);
+    OrigZip.Read('content.xml', XmlStream, Header);
     try
       XmlContent.LoadFromStream(XmlStream, TEncoding.UTF8);
     finally
@@ -64,10 +62,8 @@ begin
           for ColIndex := 0 to DataSet.FieldCount - 1 do
           begin
             FieldValue := DataSet.Fields[ColIndex].AsString;
-            // Экранируем спецсимволы XML для безопасности данных
             FieldValue := FieldValue.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;');
 
-            // Проверяем тип данных
             if DataSet.Fields[ColIndex].DataType in [ftInteger, ftFloat, ftCurrency, ftLargeint, ftBCD] then
             begin
               NumValue := DataSet.Fields[ColIndex].AsFloat.ToString(TFormatSettings.Invariant);
@@ -90,7 +86,7 @@ begin
       // 4. Поиск места вставки (Отсчитываем ровно 2 строки существующей шапки шаблона)
       InsertPos := 0;
       RowsFound := 0;
-      while RowsFound < 3 do
+      while RowsFound < 2 do
       begin
         InsertPos := ContentStr.IndexOf('</table:table-row>', InsertPos);
         if InsertPos = -1 then Break;
@@ -98,7 +94,6 @@ begin
         Inc(RowsFound);
       end;
 
-      // Безопасный откат к началу таблицы, если строк в шаблоне не нашлось
       if InsertPos = -1 then
       begin
         InsertPos := ContentStr.IndexOf('<table:table');
@@ -116,50 +111,52 @@ begin
       DataRowsBuilder.Free;
     end;
 
-    // 5. Перезаписываем ИСКЛЮЧИТЕЛЬНО файл content.xml внутри архива.
-    // Метод Add в режиме zmReadWrite автоматически обновляет/заменяет существующий файл,
-    // не затрагивая порядок других файлов и структуру сжатия mimetype!
+    // 5. Пересборка архива "с нуля" для гарантированного уничтожения дубликатов файлов
+    NewZip.Open(ASavePath, zmWrite);
+
+    // Добавляем mimetype ПЕРВЫМ и БЕЗ СЖАТИЯ
+    if OrigZip.IndexOf('mimetype') <> -1 then
+    begin
+      OrigZip.Read('mimetype', TempStream, TempHeader);
+      try
+        // КЛЮЧЕВОЙ ФИКС: очищаем флаги локального заголовка, чтобы не повредить имя файла в Linux/Windows
+        TempHeader.Flag := TempHeader.Flag and not $800; 
+        TempHeader.CompressionMethod := 0; // Метод STORE (без сжатия)
+        NewZip.Add(TempStream, 'mimetype', TempHeader.CompressionMethod);
+      finally
+        TempStream.Free;
+      end;
+    end;
+
+    // Переносим все остальные файлы, кроме content.xml и mimetype
+    for InternalFileName in OrigZip.FileNames do
+    begin
+      if (InternalFileName <> 'content.xml') and (InternalFileName <> 'mimetype') then
+      begin
+        OrigZip.Read(InternalFileName, TempStream, TempHeader);
+        try
+          TempHeader.Flag := TempHeader.Flag and not $800; // Сброс UTF-8 флага заголовка во избежание кракозябр
+          NewZip.Add(TempStream, InternalFileName, TempHeader.CompressionMethod);
+        finally
+          TempStream.Free;
+        end;
+      end;
+    end;
+
+    // Записываем наш ЕДИНСТВЕННЫЙ и обновленный content.xml
     XmlContent.Text := ContentStr;
     NewXmlStream := TStringStream.Create(XmlContent.Text, TEncoding.UTF8);
     try
-      Zip.Add(NewXmlStream, 'content.xml');
+      NewZip.Add(NewXmlStream, 'content.xml');
     finally
       NewXmlStream.Free;
     end;
 
-    Zip.Close;
+    NewZip.Close;
+    OrigZip.Close;
   finally
     XmlContent.Free;
-    Zip.Free;
-  end;
-end;
-
-
-
-
------------------
-
-
-procedure TForm1.ButtonExportClick(Sender: TObject);
-var
-  AppDir: string;
-  TemplateFile: string;
-  OutputFile: string;
-begin
-  // Получаем текущую папку запущенного приложения
-  AppDir := ExtractFilePath(ParamStr(0));
-
-  // Путь к файлу шаблона (должен лежать рядом с вашим EXE)
-  TemplateFile := TPath.Combine(AppDir, 'template_test.ods');
-  
-  // Безопасно формируем путь к подпапке output (которая создастся сама)
-  OutputFile := TPath.Combine(AppDir, TPath.Combine('output', 'template_test.ods'));
-
-  try
-    ExportToLibreOfficeLinux(DataSource1, TemplateFile, OutputFile);
-    ShowMessage('Экспорт успешно завершен! Файл сохранен в папку output.');
-  except
-    on E: Exception do
-      ShowMessage('Произошла ошибка при экспорте: ' + E.Message);
+    NewZip.Free;
+    OrigZip.Free;
   end;
 end;
