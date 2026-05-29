@@ -1,7 +1,6 @@
-// uses System.Zip, System.IOUtils,
-procedure TForm1.ExportToLibreOfficeLinux(ADataSource: TDataSource; const ATemplatePath, ASavePath: string);
+procedure ExportToLibreOfficeLinux(ADataSource: TDataSource; const ATemplatePath, ASavePath: string);
 var
-  Zip: TZipFile;
+  OrigZip, NewZip: TZipFile;
   XmlContent: TStringList;
   DataSet: TDataSet;
   ColIndex: Integer;
@@ -14,6 +13,10 @@ var
   Header: TZipHeader;
   DataRowsBuilder: TStringBuilder;
   RowsFound: Integer;
+  InternalFileName: string;
+  TargetDir: string;
+  TempStream: TStream;
+  TempHeader: TZipHeader;
 begin
   // 1. Проверки входных данных
   if (ADataSource = nil) or (ADataSource.DataSet = nil) then
@@ -23,20 +26,25 @@ begin
   if not DataSet.Active then
     DataSet.Open;
 
-  // Если старый файл отчета существует — удаляем его перед копированием
+  // ИСПРАВЛЕНИЕ: Автоматически проверяем и создаем папку назначения (например, .../output/)
+  TargetDir := TPath.GetDirectoryName(ASavePath);
+  if (TargetDir <> '') and (not TDirectory.Exists(TargetDir)) then
+    TDirectory.CreateDirectory(TargetDir);
+
+  // Если старый файл отчета уже существует — удаляем его перед записью
   if TFile.Exists(ASavePath) then
     TFile.Delete(ASavePath);
 
-  // Копируем исходный шаблон на место будущего отчета
-  TFile.Copy(ATemplatePath, ASavePath);
-
-  Zip := TZipFile.Create;
+  OrigZip := TZipFile.Create;
+  NewZip := TZipFile.Create;
   XmlContent := TStringList.Create;
+  DataRowsBuilder := TStringBuilder.Create;
   try
-    // 2. Рапаспаковываем content.xml из скопированного шаблона в память
-    Zip.Open(ASavePath, zmReadWrite);
-
-    Zip.Read('content.xml', XmlStream, Header);
+    // 2. Открываем оригинальный шаблон только для чтения
+    OrigZip.Open(ATemplatePath, zmRead);
+    
+    // Читаем исходный XML-контент в память
+    OrigZip.Read('content.xml', XmlStream, Header);
     try
       XmlContent.LoadFromStream(XmlStream, TEncoding.UTF8);
     finally
@@ -45,41 +53,35 @@ begin
 
     ContentStr := XmlContent.Text;
 
-    // 3. Подготовка XML-строк данных
-    DataRowsBuilder := TStringBuilder.Create;
+    // 3. Подготовка XML-строк данных из DataSet
     try
       DataSet.DisableControls;
       try
         DataSet.First;
-
         while not DataSet.Eof do
         begin
-          // Открываем тег строки таблицы LibreOffice Calc
           DataRowsBuilder.Append('<table:table-row>');
-
           for ColIndex := 0 to DataSet.FieldCount - 1 do
           begin
             FieldValue := DataSet.Fields[ColIndex].AsString;
-            // Экранируем спецсимволы XML для безопасности данных
+            // Экранируем спецсимволы XML
             FieldValue := FieldValue.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;');
 
-            // Проверяем тип данных (число или текст)
+            // Проверяем тип данных
             if DataSet.Fields[ColIndex].DataType in [ftInteger, ftFloat, ftCurrency, ftLargeint, ftBCD] then
             begin
               NumValue := DataSet.Fields[ColIndex].AsFloat.ToString(TFormatSettings.Invariant);
-
-              // Прямая склейка XML-тега для чисел
-              DataRowsBuilder.Append('<table:table-cell office:value-type="float" office:value="' +
+              // Запись чисел без AppendFormat
+              DataRowsBuilder.Append('<table:table-cell office:value-type="float" office:value="' + 
                 NumValue + '"><text:p>' + FieldValue + '</text:p></table:table-cell>');
             end
             else
             begin
-              // Прямая склейка XML-тега для текста
-              DataRowsBuilder.Append('<table:table-cell office:value-type="string"><text:p>' +
+              // Запись текста без AppendFormat
+              DataRowsBuilder.Append('<table:table-cell office:value-type="string"><text:p>' + 
                 FieldValue + '</text:p></table:table-cell>');
             end;
           end;
-
           DataRowsBuilder.Append('</table:table-row>');
           DataSet.Next;
         end;
@@ -87,22 +89,18 @@ begin
         DataSet.EnableControls;
       end;
 
-      // 4. Поиск места вставки (Пропускаем ровно 2 строки шапки)
+      // 4. Поиск места вставки (Отсчитываем ровно 2 строки существующей шапки шаблона)
       InsertPos := 0;
       RowsFound := 0;
-
-      // Ищем закрывающие теги строк </table:table-row>, чтобы отсчитать ровно 2 строки
       while RowsFound < 2 do
       begin
         InsertPos := ContentStr.IndexOf('</table:table-row>', InsertPos);
         if InsertPos = -1 then Break;
-
-        // Смещаем указатель за текущий закрывающий тег строки
         InsertPos := InsertPos + Length('</table:table-row>');
         Inc(RowsFound);
       end;
 
-      // Если в XML-структуре шаблона вообще нет строк, делаем безопасный откат к началу таблицы
+      // Безопасный откат к началу таблицы, если строк в шаблоне не нашлось
       if InsertPos = -1 then
       begin
         InsertPos := ContentStr.IndexOf('<table:table');
@@ -113,25 +111,73 @@ begin
       if InsertPos = -1 then
         raise Exception.Create('Ошибка структуры шаблона: в файле отсутствует табличная структура.');
 
-      // Вставляем сгенерированные строки строго после 2-й строки шаблона (начиная с 3-й)
+      // Вставляем подготовленные данные строго со строки 3
       ContentStr := ContentStr.Insert(InsertPos, DataRowsBuilder.ToString);
+    end;
     finally
       DataRowsBuilder.Free;
     end;
 
-    // 5. Записываем обновленный XML обратно в zip-архив (.ods)
+    // 5. Создаем новый файл отчета (Совместимо со всеми версиями Delphi)
+    NewZip.Open(ASavePath, zmWrite);
+
+    // Переносим все служебные файлы шаблона (стили, конфигурацию) в новый архив
+    for InternalFileName in OrigZip.FileNames do
+    begin
+      if InternalFileName <> 'content.xml' then
+      begin
+        OrigZip.Read(InternalFileName, TempStream, TempHeader);
+        try
+          NewZip.Add(TempStream, InternalFileName);
+        finally
+          TempStream.Free;
+        end;
+      end;
+    end;
+
+    // Помещаем наш обновленный content.xml с данными из СУБД
     XmlContent.Text := ContentStr;
     NewXmlStream := TStringStream.Create(XmlContent.Text, TEncoding.UTF8);
     try
-      Zip.Delete('content.xml');
-      Zip.Add(NewXmlStream, 'content.xml');
+      NewZip.Add(NewXmlStream, 'content.xml');
     finally
       NewXmlStream.Free;
     end;
 
-    Zip.Close;
+    NewZip.Close;
+    OrigZip.Close;
   finally
     XmlContent.Free;
-    Zip.Free;
+    NewZip.Free;
+    OrigZip.Free;
+  end;
+end;
+
+
+
+-----------------
+
+
+procedure TForm1.ButtonExportClick(Sender: TObject);
+var
+  AppDir: string;
+  TemplateFile: string;
+  OutputFile: string;
+begin
+  // Получаем текущую папку запущенного приложения
+  AppDir := ExtractFilePath(ParamStr(0));
+
+  // Путь к файлу шаблона (должен лежать рядом с вашим EXE)
+  TemplateFile := TPath.Combine(AppDir, 'template_test.ods');
+  
+  // Безопасно формируем путь к подпапке output (которая создастся сама)
+  OutputFile := TPath.Combine(AppDir, TPath.Combine('output', 'template_test.ods'));
+
+  try
+    ExportToLibreOfficeLinux(DataSource1, TemplateFile, OutputFile);
+    ShowMessage('Экспорт успешно завершен! Файл сохранен в папку output.');
+  except
+    on E: Exception do
+      ShowMessage('Произошла ошибка при экспорте: ' + E.Message);
   end;
 end;
